@@ -21,4 +21,4 @@ require (
 	golang.org/x/tools v0.2.0 // indirect
 )
 
-// replace github.com/quic-go/quic-go => github.com/apernet/quic-go v0.32.1-0.20230226201325-e07aae1a800b
+replace github.com/quic-go/quic-go => github.com/apernet/quic-go v0.32.1-0.20230226201325-e07aae1a800b
