@@ -7,18 +7,23 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sync/atomic"
+	"time"
+
+	"github.com/quic-go/quic-go/quicvarint"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/quicvarint"
 )
 
 const (
 	frameTypeProxyRequest  = 0x401
 	frameTypeProxyResponse = 0x402
+
+	httpStatusKnocked = 233
 )
 
 func server() {
@@ -63,6 +68,9 @@ func server() {
 func serverHandleConn(conn quic.Connection, password string) error {
 	handler := &h3sHandler{
 		Password: password,
+		Dialer: &net.Dialer{
+			Timeout: 10 * time.Second,
+		},
 	}
 	h3s := http3.Server{
 		Handler:        handler,
@@ -73,15 +81,15 @@ func serverHandleConn(conn quic.Connection, password string) error {
 
 type h3sHandler struct {
 	Password string
+	Dialer   *net.Dialer
 
 	knocked atomic.Bool
 }
 
 func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.URL.Path == "/knock" {
-		// Are we knocked already?
 		if h.knocked.Load() {
-			_, _ = w.Write([]byte("OK"))
+			w.WriteHeader(httpStatusKnocked)
 			return
 		}
 		// Check password in header
@@ -93,8 +101,8 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		// Password is correct
 		h.knocked.Store(true)
-		_, _ = w.Write([]byte("OK"))
 		log.Printf("successfully knocked from %s\n", r.RemoteAddr)
+		w.WriteHeader(httpStatusKnocked)
 		return
 	}
 	_ = h.writeRandomQuote(w)
@@ -106,23 +114,49 @@ func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, conn quic.Connectio
 	}
 	log.Printf("proxy request from %s, stream id: %d\n", conn.RemoteAddr().String(), stream.StreamID())
 	go func() {
-		defer func() {
-			_ = stream.Close()
-		}()
-		qr := quicvarint.NewReader(stream)
-		l, err := quicvarint.Read(qr)
-		if err != nil {
-			log.Println("read request length error:", err)
-			return
-		}
-		req, err := io.ReadAll(io.LimitReader(qr, int64(l)))
-		if err != nil {
-			log.Println("read request error:", err)
-			return
-		}
-		log.Printf("request: %s\n", req)
+		h.handleProxyStream(stream)
+		_ = stream.Close()
+		log.Printf("proxy request from %s, stream id: %d closed\n", conn.RemoteAddr().String(), stream.StreamID())
 	}()
 	return true, nil
+}
+
+func (h *h3sHandler) handleProxyStream(stream quic.Stream) {
+	// Proxy request format:
+	// 1. address length (varint)
+	// 2. address (string)
+
+	qr := quicvarint.NewReader(stream)
+	l, err := quicvarint.Read(qr)
+	if err != nil {
+		log.Println("read address length error:", err)
+		return
+	}
+	addr := make([]byte, l)
+	_, err = io.ReadFull(stream, addr)
+	if err != nil {
+		log.Println("read address error:", err)
+		return
+	}
+
+	// Connect to the target address
+	tconn, err := h.Dialer.Dial("tcp", string(addr))
+	// Proxy response format:
+	// 1. error code (byte) 0=success, 1=error
+	if err != nil {
+		log.Println("dial error:", err)
+		_, _ = stream.Write([]byte{1})
+		return
+	}
+	defer tconn.Close()
+	_, _ = stream.Write([]byte{0})
+
+	// Proxy data
+	go func() {
+		_, _ = io.Copy(tconn, stream)
+		_ = tconn.Close()
+	}()
+	_, _ = io.Copy(stream, tconn)
 }
 
 func (h *h3sHandler) writeRandomQuote(w http.ResponseWriter) error {

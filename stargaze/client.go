@@ -4,13 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -57,16 +55,10 @@ func client() {
 	if err != nil {
 		log.Fatalln("knock request error:", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalln("knock request returned status code:", resp.StatusCode)
+	if resp.StatusCode != httpStatusKnocked {
+		log.Fatalln("knock failed, status code:", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatalln("read knock response error:", err)
-	}
-	if string(body) != "OK" {
-		log.Fatalln("knock response error:", string(body))
-	}
+	_ = resp.Body.Close()
 
 	log.Println("knock success, opening proxy stream")
 
@@ -74,15 +66,45 @@ func client() {
 	if err != nil {
 		log.Fatalln("open proxy stream error:", err)
 	}
-	reqBs := []byte(fmt.Sprintf("早上好中国现在我有冰淇淋 %s", time.Now().String()))
-	var payload []byte
-	payload = quicvarint.Append(payload, frameTypeProxyRequest)
-	payload = quicvarint.Append(payload, uint64(len(reqBs)))
-	payload = append(payload, reqBs...)
 
-	if _, err := stream.Write(payload); err != nil {
+	target := "ipinfo.io:80"
+
+	var reqBs []byte
+	reqBs = quicvarint.Append(reqBs, frameTypeProxyRequest)
+	reqBs = quicvarint.Append(reqBs, uint64(len(target)))
+	reqBs = append(reqBs, []byte(target)...)
+
+	_, err = stream.Write(reqBs)
+	if err != nil {
 		log.Fatalln("write proxy request error:", err)
 	}
 
-	time.Sleep(5 * time.Second)
+	log.Println("proxy request sent, waiting for response")
+
+	respCode := make([]byte, 1)
+	_, err = io.ReadFull(stream, respCode)
+	if err != nil {
+		log.Fatalln("read proxy response error:", err)
+	}
+	if respCode[0] != 0 {
+		log.Fatalln("proxy request failed, error code:", respCode[0])
+	}
+
+	log.Println("proxy connection established")
+
+	_, err = stream.Write([]byte("GET / HTTP/1.1\r\n" +
+		"Host: ipinfo.io\r\n" +
+		"Connection: close\r\n\r\n"))
+	if err != nil {
+		log.Fatalln("write HTTP request error:", err)
+	}
+
+	log.Println("HTTP request sent, waiting for response")
+
+	hResp, err := io.ReadAll(stream)
+	if err != nil {
+		log.Fatalln("read HTTP response error:", err)
+	}
+
+	log.Printf("HTTP response:\n%s", hResp)
 }
